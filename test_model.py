@@ -45,7 +45,7 @@ def parse_args():
                         default='/RAID5/projects/likeyang/happy/MEGConformer/data/split_data',
                         help='split_data目录路径（包含test_-_开头的文件）')
     # parser.add_argument('--split_data_dir', type=str,
-    #                     default='/RAID5/projects/likeyang/happy/MEGConformer/data/empty_data_split',
+    #                     default='/RAID5/projects/likeyang/happy/MEGConformer/data/split_empty',
     #                     help='split_data目录路径（包含test_-_开头的文件）')
 
     # 输出相关
