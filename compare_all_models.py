@@ -34,27 +34,25 @@ def load_result_json(json_path):
     # 提取模型名称
     model_name = data.get('checkpoint', 'Unknown')
 
-    # 提取受试者1-71的数据
+    # 提取所有受试者的数据
     per_subject = data.get('per_subject', [])
     subject_data = []
 
     for subject_info in per_subject:
         sub_id = subject_info['subject_id']
-        if 1 <= sub_id <= 85:  # 提取所有受试者（1-85）用于混合得分
-            subject_data.append({
-                'subject_id': sub_id,
-                'pearson': subject_info['avg_pearson']
-            })
+        subject_data.append({
+            'subject_id': sub_id,
+            'pearson': subject_info['avg_pearson']
+        })
 
     # 如果没有per_subject，尝试从per_sample重建（兼容旧格式）
     if not subject_data and 'per_sample' in data:
         subject_dict = {}
         for sample in data['per_sample']:
             sub_id = sample['subject_id']
-            if 1 <= sub_id <= 85:
-                if sub_id not in subject_dict:
-                    subject_dict[sub_id] = []
-                subject_dict[sub_id].append(sample['pearson'])
+            if sub_id not in subject_dict:
+                subject_dict[sub_id] = []
+            subject_dict[sub_id].append(sample['pearson'])
 
         # 计算每个受试者的平均
         for sub_id in sorted(subject_dict.keys()):
@@ -78,7 +76,7 @@ def find_all_test_results():
     results = []
 
     # 1. ADT项目的baseline模型 - 在项目根目录的test_results下
-    adt_test_results_dir = '/RAID5/projects/likeyang/ADT_Network-main/test_results'
+    adt_test_results_dir = '/RAID5/projects/likeyang/ADT_Network-main/task2_regression_MEG/experiments/test_results'
 
     if os.path.exists(adt_test_results_dir):
         for model_dir in os.listdir(adt_test_results_dir):
@@ -93,7 +91,7 @@ def find_all_test_results():
                 })
 
     # 2. NeuroConformer模型
-    conformer_json = '/RAID5/projects/likeyang/happy/NeuroConformer/test_results_eval/conformer_v2_nlayer4_dmodel256_nhead4_gscale1.0_dist_20251216_000230_best_model/test_results.json'
+    conformer_json = '/RAID5/projects/likeyang/happy/MEGConformer/test_results_eval/conformer_v2_nlayer4_dmodel256_nhead4_gscale1.0_dist_20260404_175220_best_model/test_results.json'
 
     if os.path.exists(conformer_json):
         model_key = 'NEUROCONFORMER'
@@ -125,7 +123,7 @@ def compute_cohens_d(x, y):
 
 def statistical_comparison(all_data, output_dir='comparison_results'):
     """
-    对所有模型进行成对的统计显著性检验，并计算混合得分
+    对所有模型进行成对的统计显著性检验
 
     Args:
         all_data: list of dict with keys ['model_key', 'model_name', 'subject_pearsons', 'mean_pearson', 'source']
@@ -202,62 +200,6 @@ def statistical_comparison(all_data, output_dir='comparison_results'):
     print("  0.2 ≤ |d| < 0.5: 中等效应")
     print("  0.5 ≤ |d| < 0.8: 大效应")
     print("  |d| ≥ 0.8: 非常大效应")
-    print(f"{'='*80}\n")
-
-    # ========== 计算混合得分 ==========
-    print(f"\n{'='*80}")
-    print("混合得分 (综合评估)")
-    print(f"{'='*80}")
-    print("计算公式: 混合得分 = (受试者1-71平均分 × 2/3) + (受试者72-85平均分 × 1/3)\n")
-
-    mixed_scores_data = []
-    for data in all_data:
-        model_name = data['model_name']
-        subject_data = data.get('subject_data', [])
-
-        if not subject_data:
-            print(f"警告: {model_name} 缺少subject_data，跳过混合得分计算")
-            continue
-
-        # 分离受试者1-71和72-85
-        group_1_71 = [s['pearson'] for s in subject_data if 1 <= s['subject_id'] <= 71]
-        group_72_85 = [s['pearson'] for s in subject_data if 72 <= s['subject_id'] <= 85]
-
-        # 计算各组平均值
-        mean_1_71 = np.mean(group_1_71) if group_1_71 else 0
-        mean_72_85 = np.mean(group_72_85) if group_72_85 else 0
-
-        # 计算混合得分
-        if group_72_85:
-            mixed_score = (mean_1_71 * 2/3) + (mean_72_85 * 1/3)
-        else:
-            # 如果没有72-85的数据，只用1-71的平均值
-            mixed_score = mean_1_71
-
-        mixed_scores_data.append({
-            'Model': model_name,
-            'Mean (Subjects 1-71)': f"{mean_1_71:.4f}",
-            'Mean (Subjects 72-85)': f"{mean_72_85:.4f}",
-            'Mixed Score': f"{mixed_score:.4f}",
-            'N (1-71)': len(group_1_71),
-            'N (72-85)': len(group_72_85)
-        })
-
-    # 创建DataFrame并按混合得分排序
-    mixed_df = pd.DataFrame(mixed_scores_data)
-    mixed_df = mixed_df.sort_values(by='Mixed Score', ascending=False,
-                                     key=lambda x: x.astype(float))
-
-    # 保存到CSV
-    mixed_csv_path = os.path.join(output_dir, 'mixed_scores.csv')
-    mixed_df.to_csv(mixed_csv_path, index=False)
-    print(f"✓ 混合得分已保存到: {mixed_csv_path}\n")
-
-    # 打印表格
-    print(mixed_df.to_string(index=False))
-    print(f"\n说明:")
-    print("  - 混合得分综合考虑了常规受试者(1-71)和新受试者(72-85)的表现")
-    print("  - 权重: 1-71占2/3, 72-85占1/3")
     print(f"{'='*80}\n")
 
     return comparison_df
@@ -403,7 +345,7 @@ def plot_comparison(all_data, output_dir='comparison_results'):
 
     # 打印表格
     print(f"\n{'='*100}")
-    print("模型对比统计表 (受试者1-71)")
+    print("模型对比统计表")
     print(f"{'='*100}")
     print(df.to_string(index=False))
     print(f"{'='*100}\n")
@@ -440,26 +382,25 @@ def main():
             display_name = r['model_name']
 
             if len(subject_data) == 0:
-                print(f"警告: {display_name} 没有受试者1-85的数据，跳过")
+                print(f"警告: {display_name} 没有受试者数据，跳过")
                 continue
-            # 如果是ADT模型（不是所有ADT来源的模型），给所有Pearson值加0.02
-            if r['model_key'] == 'ADT':
-                subject_data = [{**s, 'pearson': s['pearson'] + 0.02} for s in subject_data]
-                mean_pearson = np.mean([s['pearson'] for s in subject_data])
-                print(f"✓ {display_name}: {len(subject_data)} 个受试者, 平均Pearson = {mean_pearson:.4f} (已加0.02)")
-            else:
-                print(f"✓ {display_name}: {len(subject_data)} 个受试者, 平均Pearson = {mean_pearson:.4f}")
-
-            # 提取Pearson值列表供绘图使用（只用1-71）
-            subject_pearsons = [s['pearson'] for s in subject_data if 1 <= s['subject_id'] <= 71]
-            mean_pearson_1_71 = np.mean(subject_pearsons) if subject_pearsons else 0
+            # # 如果是ADT模型（不是所有ADT来源的模型），给所有Pearson值加0.02
+            # if r['model_key'] == 'ADT':
+            #     subject_data = [{**s, 'pearson': s['pearson'] + 0.02} for s in subject_data]
+            #     mean_pearson = np.mean([s['pearson'] for s in subject_data])
+            #     print(f"✓ {display_name}: {len(subject_data)} 个受试者, 平均Pearson = {mean_pearson:.4f} (已加0.02)")
+            # else:
+            #     print(f"✓ {display_name}: {len(subject_data)} 个受试者, 平均Pearson = {mean_pearson:.4f}")
+            print(f"✓ {display_name}: {len(subject_data)} 个受试者, 平均Pearson = {mean_pearson:.4f}")
+            # 提取所有受试者的Pearson值列表供绘图使用
+            subject_pearsons = [s['pearson'] for s in subject_data]
 
             all_data.append({
                 'model_key': r['model_key'],
                 'model_name': display_name,
-                'subject_data': subject_data,  # 保留完整的subject_id和pearson信息（1-85）
-                'subject_pearsons': subject_pearsons,  # 用于绘图（只有1-71）
-                'mean_pearson': mean_pearson_1_71,  # 1-71的平均值
+                'subject_data': subject_data,
+                'subject_pearsons': subject_pearsons,
+                'mean_pearson': mean_pearson,
                 'source': r['source']
             })
 

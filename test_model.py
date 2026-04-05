@@ -42,11 +42,11 @@ def parse_args():
 
     # 数据集路径（固定）
     parser.add_argument('--split_data_dir', type=str,
-                        default='/RAID5/projects/likeyang/happy/NeuroConformer/data/split_data',
+                        default='/RAID5/projects/likeyang/happy/MEGConformer/data/split_data',
                         help='split_data目录路径（包含test_-_开头的文件）')
-    parser.add_argument('--test_data_dir', type=str,
-                        default='/RAID5/projects/likeyang/happy/NeuroConformer/data/test_data',
-                        help='test_data目录路径（包含sub-72到sub-85的文件）')
+    # parser.add_argument('--split_data_dir', type=str,
+    #                     default='/RAID5/projects/likeyang/happy/MEGConformer/data/empty_data_split',
+    #                     help='split_data目录路径（包含test_-_开头的文件）')
 
     # 输出相关
     parser.add_argument('--output_dir', type=str, default='test_results_eval',
@@ -57,6 +57,22 @@ def parse_args():
                         help='是否保存每个样本的预测结果')
 
     return parser.parse_args()
+
+
+def _infer_within_sub_num(state_dict, args_dict):
+    """从 state_dict 中推断 within_sub_num，兼容新旧 checkpoint"""
+    # 优先从 args 读
+    if 'within_sub_num' in args_dict:
+        return args_dict['within_sub_num']
+    # 从 sub_proj.weight shape 推断: [d_model, within_sub_num]
+    key = 'sub_proj.weight'
+    if key in state_dict:
+        return state_dict[key].shape[1]
+    # 兼容 DDP 前缀
+    key_ddp = 'module.sub_proj.weight'
+    if key_ddp in state_dict:
+        return state_dict[key_ddp].shape[1]
+    return 17  # 最终 fallback
 
 
 def load_checkpoint_and_create_model(checkpoint_path, device):
@@ -99,6 +115,19 @@ def load_checkpoint_and_create_model(checkpoint_path, device):
         print(f"  Val Pearson: {checkpoint.get('val_pearson', 'N/A')}")
         print(f"  Best Epoch: {checkpoint.get('epoch', 'N/A')}")
 
+    # 先读 state_dict，用于推断 within_sub_num
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        raise ValueError("Checkpoint中没有找到'model_state_dict'或'state_dict'")
+
+    # 移除DDP的'module.'前缀（如果有）
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_state_dict[k[7:] if k.startswith('module.') else k] = v
+
     # 根据配置创建模型
     model = Decoder(
         in_channel=args_dict.get('in_channel', 64),
@@ -110,7 +139,7 @@ def load_checkpoint_and_create_model(checkpoint_path, device):
         fft_conv1d_padding=args_dict.get('fft_conv1d_padding', (4, 0)),
         dropout=args_dict.get('dropout', 0.4),
         g_con=args_dict.get('g_con', True),
-        within_sub_num=85,  # 固定为85（覆盖1-85所有受试者）
+        within_sub_num=_infer_within_sub_num(new_state_dict, args_dict),
         conv_kernel_size=args_dict.get('conv_kernel_size', 31),
         use_relative_pos=args_dict.get('use_relative_pos', True),
         use_macaron_ffn=args_dict.get('use_macaron_ffn', True),
@@ -118,27 +147,15 @@ def load_checkpoint_and_create_model(checkpoint_path, device):
         use_gated_residual=args_dict.get('use_gated_residual', True),
         use_mlp_head=args_dict.get('use_mlp_head', True),
         gradient_scale=args_dict.get('gradient_scale', 1.0),
-        skip_cnn=args_dict.get('skip_cnn', True),  # 修正：默认值应该是True（与训练脚本一致）
+        skip_cnn=args_dict.get('skip_cnn', True),
         use_se=args_dict.get('use_se', True),
+        use_spatial_gat=args_dict.get('use_spatial_gat', False),
+        gat_n_heads=args_dict.get('gat_n_heads', 4),
+        gat_d_head=args_dict.get('gat_d_head', 32),
+        sensor_pos=args_dict.get('sensor_pos', None),
     ).to(device)
 
-    # 加载权重（兼容DDP和非DDP的checkpoint）
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    elif 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-    else:
-        raise ValueError("Checkpoint中没有找到'model_state_dict'或'state_dict'")
-
-    # 移除DDP的'module.'前缀（如果有）
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.'):
-            new_state_dict[k[7:]] = v
-        else:
-            new_state_dict[k] = v
-
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict, strict=False)
     model.eval()
 
     print(f"\n✓ 模型权重加载成功")
@@ -147,13 +164,9 @@ def load_checkpoint_and_create_model(checkpoint_path, device):
     return model, args_dict
 
 
-def load_test_data(split_data_dir, test_data_dir, sample_rate=64, win_len=10):
+def load_test_data(split_data_dir, sample_rate=64, win_len=10):
     """
-    加载测试数据
-
-    包含两部分:
-    1. split_data中的test文件（受试者1-71）
-    2. test_data中sub-72到sub-85的文件
+    加载测试数据（仅从 split_data 加载）
 
     Returns:
         test_samples: list of (eeg_data, envelope_data, subject_id)
@@ -165,8 +178,8 @@ def load_test_data(split_data_dir, test_data_dir, sample_rate=64, win_len=10):
     input_length = sample_rate * win_len
     test_samples = []
 
-    # ========== 第1部分: split_data中的test文件 ==========
-    print("\n[1/2] 从split_data加载test文件...")
+    # ========== 从split_data中加载test文件 ==========
+    print("\n从split_data加载test文件...")
     test_files = sorted(glob.glob(os.path.join(split_data_dir, 'test_-_*')))
 
     # 按受试者分组
@@ -196,56 +209,13 @@ def load_test_data(split_data_dir, test_data_dir, sample_rate=64, win_len=10):
         eeg_data = np.load(eeg_file)
         envelope_data = np.load(envelope_file)
 
+        # 兼容 [C, T] 和 [T, C] 两种格式，统一转为 [T, C]
+        if eeg_data.ndim == 2 and eeg_data.shape[0] < eeg_data.shape[1]:
+            eeg_data = eeg_data.T  # [C, T] → [T, C]
+
         test_samples.append((eeg_data, envelope_data, sub_id))
 
     print(f"  ✓ 加载完成，共 {len(test_samples)} 个样本")
-
-    # ========== 第2部分: test_data中sub-72到sub-85的JSON文件 ==========
-    print("\n[2/2] 从test_data加载sub-72到sub-85（JSON格式）...")
-
-    additional_count = 0
-    eeg_json_dir = os.path.join(test_data_dir, 'preprocessed_eeg')
-    label_json_dir = os.path.join(test_data_dir, 'labels')
-
-    for sub_id in range(72, 86):  # 72-85
-        # JSON文件命名: sub-072.json
-        eeg_json_file = os.path.join(eeg_json_dir, f'sub-{sub_id:03d}.json')
-        label_json_file = os.path.join(label_json_dir, f'sub-{sub_id:03d}.json')
-
-        if not os.path.exists(eeg_json_file):
-            # print(f"  警告: 未找到sub-{sub_id:03d}的文件（可能缺失）")
-            continue
-
-        if not os.path.exists(label_json_file):
-            print(f"  警告: 未找到sub-{sub_id:03d}的label文件")
-            continue
-
-        # 加载JSON数据
-        with open(eeg_json_file, 'r') as f:
-            eeg_json = json.load(f)
-
-        with open(label_json_file, 'r') as f:
-            label_json = json.load(f)
-
-        # JSON结构: {"sub-072_0": [[eeg_channels], ...], "sub-072_1": [...], ...}
-        # 遍历每个recording
-        for key in eeg_json.keys():
-            if key not in label_json:
-                print(f"  警告: {key} 在label文件中不存在")
-                continue
-
-            # eeg_json[key]: [[ch1, ch2, ...], [ch1, ch2, ...], ...]  # [time, channels]
-            # label_json[key]: [[env1_samples], [metadata]]，其中每个sample是[value]格式
-            eeg_data = np.array(eeg_json[key])  # [time_steps, n_channels]
-
-            # Label第一个元素是attended envelope
-            envelope_list = label_json[key][0]  # [[val], [val], ...]
-            envelope_data = np.array([val[0] for val in envelope_list]).reshape(-1, 1)  # [time_steps, 1]
-
-            test_samples.append((eeg_data, envelope_data, sub_id - 1))  # 0-based
-            additional_count += 1
-
-    print(f"  ✓ 加载完成，新增 {additional_count} 个样本（来自test_data的JSON文件）")
 
     print(f"\n{'='*80}")
     print(f"测试集总计: {len(test_samples)} 个样本")
@@ -393,18 +363,14 @@ def save_results(results, args_dict, output_dir, checkpoint_name, save_predictio
             'recordings': pearsons  # 该受试者所有recordings的Pearson
         })
 
-    # ========== 第2步：按受试者范围分组（使用每个受试者的平均Pearson）==========
-    group_1_71 = []  # 受试者1-71的平均Pearson列表
-    group_72_85 = []  # 受试者72-85的平均Pearson列表
-
-    for sub_id, avg_pearson in subject_avg_pearsons.items():
-        if 1 <= sub_id <= 71:
-            group_1_71.append(avg_pearson)
-        elif 72 <= sub_id <= 85:
-            group_72_85.append(avg_pearson)
-
     # 所有受试者的平均Pearson
     all_subject_pearsons = list(subject_avg_pearsons.values())
+
+    if not all_subject_pearsons:
+        print("错误: 没有找到任何测试样本！请检查 --split_data_dir 路径是否正确，")
+        print(f"  当前路径: {args_dict.get('split_data_dir', '未知')}")
+        print("  以及该目录下是否存在 test_-_ 开头的 .npy 文件。")
+        raise ValueError("all_subject_pearsons 为空，无法计算统计指标")
 
     summary = {
         'checkpoint': checkpoint_name,
@@ -425,19 +391,7 @@ def save_results(results, args_dict, output_dir, checkpoint_name, save_predictio
             'min_pearson': float(np.min(all_subject_pearsons)),
             'max_pearson': float(np.max(all_subject_pearsons)),
         },
-        'group_1_71': {
-            'num_subjects': len(group_1_71),
-            'mean_pearson': float(np.mean(group_1_71)) if group_1_71 else 0,
-            'std_pearson': float(np.std(group_1_71)) if group_1_71 else 0,
-            'median_pearson': float(np.median(group_1_71)) if group_1_71 else 0,
-        },
-        'group_72_85': {
-            'num_subjects': len(group_72_85),
-            'mean_pearson': float(np.mean(group_72_85)) if group_72_85 else 0,
-            'std_pearson': float(np.std(group_72_85)) if group_72_85 else 0,
-            'median_pearson': float(np.median(group_72_85)) if group_72_85 else 0,
-        },
-        'per_subject': per_subject_details,  # 每个受试者的详细信息
+        'per_subject': per_subject_details,
         'per_sample': [
             {
                 'sample_idx': s['sample_idx'],
@@ -454,30 +408,26 @@ def save_results(results, args_dict, output_dir, checkpoint_name, save_predictio
         json.dump(summary, f, indent=2)
     print(f"✓ 结果已保存到: {json_path}")
 
-    # ========== 绘制箱线图（只生成1-71的图，显示每个受试者的平均Pearson）==========
-    if not group_1_71:
-        print("警告: 没有1-71号受试者的数据，跳过箱线图生成")
-    else:
-        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    # ========== 绘制箱线图 ==========
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
 
-        # 只绘制受试者1-71（每个受试者平均后的Pearson）
-        bp = ax.boxplot([group_1_71], labels=['Subjects 1-71'],
-                         patch_artist=True, showmeans=True,
-                         meanprops=dict(marker='D', markerfacecolor='red', markersize=10),
-                         boxprops=dict(facecolor='lightblue'),
-                         medianprops=dict(color='darkblue', linewidth=2.5))
+    bp = ax.boxplot([all_subject_pearsons], labels=['All Subjects'],
+                     patch_artist=True, showmeans=True,
+                     meanprops=dict(marker='D', markerfacecolor='red', markersize=10),
+                     boxprops=dict(facecolor='lightblue'),
+                     medianprops=dict(color='darkblue', linewidth=2.5))
 
-        ax.set_ylabel('Pearson Correlation (per subject avg)', fontsize=14)
-        ax.set_title(f'Test Set Performance (Subjects 1-71)\nn_subjects={len(group_1_71)}, μ={np.mean(group_1_71):.4f}',
-                      fontsize=15, fontweight='bold')
-        ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylabel('Pearson Correlation (per subject avg)', fontsize=14)
+    ax.set_title(f'Test Set Performance\nn_subjects={len(all_subject_pearsons)}, μ={np.mean(all_subject_pearsons):.4f}',
+                  fontsize=15, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
 
-        plt.tight_layout()
+    plt.tight_layout()
 
-        boxplot_path = os.path.join(output_dir, 'pearson_boxplot_1_71.png')
-        plt.savefig(boxplot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"✓ 箱线图（1-71）已保存到: {boxplot_path}")
+    boxplot_path = os.path.join(output_dir, 'pearson_boxplot.png')
+    plt.savefig(boxplot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✓ 箱线图已保存到: {boxplot_path}")
 
     # ========== 保存预测结果（可选）==========
     if save_predictions:
@@ -494,26 +444,15 @@ def save_results(results, args_dict, output_dir, checkpoint_name, save_predictio
 
         print(f"✓ 预测结果已保存到: {pred_dir}")
 
-    # ========== 打印汇总 ==========
     print(f"\n{'='*80}")
     print("评估结果汇总")
     print(f"{'='*80}")
-    print(f"\n【全部受试者 (1-85)】")
+    print(f"\n【全部受试者】")
     print(f"  受试者数: {summary['overall']['num_subjects']}")
     print(f"  总recordings数: {summary['overall']['num_recordings']}")
     print(f"  平均Pearson (per subject): {summary['overall']['mean_pearson']:.4f} ± {summary['overall']['std_pearson']:.4f}")
     print(f"  中位数: {summary['overall']['median_pearson']:.4f}")
     print(f"  范围: [{summary['overall']['min_pearson']:.4f}, {summary['overall']['max_pearson']:.4f}]")
-
-    print(f"\n【受试者1-71】")
-    print(f"  受试者数: {summary['group_1_71']['num_subjects']}")
-    print(f"  平均Pearson (per subject): {summary['group_1_71']['mean_pearson']:.4f} ± {summary['group_1_71']['std_pearson']:.4f}")
-    print(f"  中位数: {summary['group_1_71']['median_pearson']:.4f}")
-
-    print(f"\n【受试者72-85】")
-    print(f"  受试者数: {summary['group_72_85']['num_subjects']}")
-    print(f"  平均Pearson (per subject): {summary['group_72_85']['mean_pearson']:.4f} ± {summary['group_72_85']['std_pearson']:.4f}")
-    print(f"  中位数: {summary['group_72_85']['median_pearson']:.4f}")
     print(f"{'='*80}\n")
 
     return summary
@@ -527,7 +466,7 @@ def test_single_checkpoint(checkpoint_path, args):
     model, args_dict = load_checkpoint_and_create_model(checkpoint_path, device)
 
     # 加载测试数据
-    test_samples = load_test_data(args.split_data_dir, args.test_data_dir)
+    test_samples = load_test_data(args.split_data_dir)
 
     # 评估
     results = evaluate_model(model, test_samples, device)
@@ -580,8 +519,6 @@ def test_multiple_checkpoints(args):
                 'use_mlp_head': summary['model_config']['use_mlp_head'],
                 'd_model': summary['model_config']['d_model'],
                 'Pearson_All': summary['overall']['mean_pearson'],
-                'Pearson_1-71': summary['group_1_71']['mean_pearson'],
-                'Pearson_72-85': summary['group_72_85']['mean_pearson'],
             }
             comparison_data.append(row)
 

@@ -103,6 +103,15 @@ parser.add_argument('--llrd_output_scale', type=float, default=0.5, help='LR sca
 parser.add_argument('--output_grad_scale', type=float, default=1, help='scale factor for output head gradients after backward')
 # ===================================
 
+# Spatial GAT parameters
+parser.add_argument('--use_spatial_gat', action='store_true', default=False,
+                    help='在最前端加入空间图注意力')
+parser.add_argument('--gat_n_heads', type=int, default=4, help='GAT注意力头数')
+parser.add_argument('--gat_d_head', type=int, default=32, help='GAT每头维度')
+parser.add_argument('--sensor_pos_file', type=str,
+                    default='/RAID5/projects/likeyang/MEGdenoise/vision/sensors_mecg64.mat',
+                    help='传感器坐标.mat文件路径')
+
 parser.add_argument('--dataset_folder', type=str, default="/RAID5/projects/likeyang/happy/MEGConformer/data", help='write down your absolute path of dataset folder')
 parser.add_argument('--split_folder', type=str, default="split_data")
 parser.add_argument('--experiment_folder', default=None, help='write down experiment name')
@@ -118,6 +127,13 @@ parser.add_argument('--use_amp', action='store_true', help='use automatic mixed 
 parser.add_argument('--windows_per_sample', type=int, default=20, help='number of windows sampled per sample in one epoch')
 
 args = parser.parse_args()
+
+# Load sensor positions for spatial GAT (if enabled)
+import scipy.io
+sensor_pos = None
+if args.use_spatial_gat:
+    mat = scipy.io.loadmat(args.sensor_pos_file)
+    sensor_pos = mat['pos']  # [64, 3]
 
 # Set random seed for reproducibility
 torch.manual_seed(args.seed)
@@ -360,7 +376,11 @@ def main():
         use_mlp_head=args.use_mlp_head,
         gradient_scale=args.gradient_scale,
         skip_cnn=args.skip_cnn,  # 是否跳过CNN特征提取
-        use_se=args.use_se       # 是否使用SE通道注意力(独立控制)
+        use_se=args.use_se,       # 是否使用SE通道注意力(独立控制)
+        use_spatial_gat=args.use_spatial_gat,
+        gat_n_heads=args.gat_n_heads,
+        gat_d_head=args.gat_d_head,
+        sensor_pos=sensor_pos,
     ).to(device)
     # ==============================================
 

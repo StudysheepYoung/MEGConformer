@@ -75,6 +75,71 @@ class SEBlock(nn.Module):
         return x * y.expand_as(x)
 
 
+class SpatialChannelGAT(nn.Module):
+    """
+    空间感知的MEG通道图注意力
+    64个通道作为图节点，Q/K来自空间坐标嵌入，V来自实际数据
+    输入/输出: [B, T, n_channels]
+    """
+    def __init__(self, n_channels=64, d_head=32, n_heads=4, dropout=0.1, sensor_pos=None):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_heads = n_heads
+        self.d_head = d_head
+        d_total = n_heads * d_head
+
+        # 将3D传感器坐标映射为通道嵌入（Q/K来源）
+        self.channel_embed = nn.Linear(3, d_total)
+
+        # 注册标准化后的空间坐标（固定，不参与训练）
+        if sensor_pos is not None:
+            pos = torch.FloatTensor(sensor_pos)
+            pos = (pos - pos.mean(0)) / (pos.std(0) + 1e-8)
+            self.register_buffer('channel_pos', pos)          # [64, 3]
+
+            # 空间距离偏置（距离越近偏置越大）
+            dist = torch.cdist(pos, pos)                       # [64, 64]
+            sigma = dist.median().clamp(min=1e-6)
+            self.register_buffer('spatial_bias', -dist / sigma)  # [64, 64]
+        else:
+            # 即使sensor_pos为None，也注册buffer占位，以便load_state_dict能加载
+            self.register_buffer('channel_pos', torch.zeros(n_channels, 3))
+            self.register_buffer('spatial_bias', torch.zeros(n_channels, n_channels))
+
+        self.W_q = nn.Linear(d_total, d_total, bias=False)
+        self.W_k = nn.Linear(d_total, d_total, bias=False)
+        self.W_v = nn.Linear(n_channels, n_channels, bias=False)
+        self.out_proj = nn.Linear(n_channels, n_channels)
+        self.norm = nn.LayerNorm(n_channels)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: [B, T, C=64]
+        B, T, C = x.shape
+
+        # 从空间坐标计算通道嵌入 [64, d_total]
+        ch_emb = self.channel_embed(self.channel_pos)
+
+        # 多头 Q, K: [H, 64, d_head]
+        q = self.W_q(ch_emb).view(C, self.n_heads, self.d_head).permute(1, 0, 2)
+        k = self.W_k(ch_emb).view(C, self.n_heads, self.d_head).permute(1, 0, 2)
+
+        # 注意力分数 [H, 64, 64]
+        attn = torch.bmm(q, k.transpose(1, 2)) / (self.d_head ** 0.5)
+        if self.spatial_bias is not None:
+            attn = attn + self.spatial_bias.unsqueeze(0)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        attn = attn.mean(0)  # [64, 64]
+
+        # 应用到时间序列值
+        v = self.W_v(x)                      # [B, T, 64]
+        out = torch.matmul(v, attn.t())       # [B, T, 64]
+        out = self.out_proj(out)
+
+        return self.norm(x + self.dropout(out))
+
+
 class GatedResidual(nn.Module):
     """
     门控残差连接
@@ -187,9 +252,25 @@ class Decoder(nn.Module):
                  gradient_scale=1.0,       # 梯度缩放因子
                  skip_cnn=True,            # 是否跳过CNN特征提取(直接用原始数据)
                  use_se=True,              # 是否使用SE通道注意力模块(独立控制)
+                 use_spatial_gat=False,   # 是否使用空间图注意力
+                 gat_n_heads=4,           # GAT 注意力头数
+                 gat_d_head=32,           # 每头维度
+                 sensor_pos=None,         # [64,3] numpy 传感器坐标
                  **kwargs):
 
         super(Decoder, self).__init__()
+
+        # 空间图注意力（在所有其他模块之前初始化）
+        self.use_spatial_gat = use_spatial_gat
+        if use_spatial_gat:
+            self.spatial_gat = SpatialChannelGAT(
+                n_channels=in_channel,
+                d_head=gat_d_head,
+                n_heads=gat_n_heads,
+                dropout=dropout,
+                sensor_pos=sensor_pos
+            )
+
         self.g_con = g_con
         self.within_sub_num = within_sub_num
         self.use_sinusoidal_pos = use_sinusoidal_pos
@@ -273,6 +354,9 @@ class Decoder(nn.Module):
         """
         # import pdb
         # pdb.set_trace()
+
+        if self.use_spatial_gat:
+            dec_input = self.spatial_gat(dec_input)  # [B, T, 64] → [B, T, 64]
 
         if self.skip_cnn:
             # ============ 跳过CNN特征提取,直接用原始数据 ============
